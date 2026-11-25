@@ -1,0 +1,197 @@
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+def build_dimensions(clean_df):
+    # 1. Dimensión Producto (1 fila por product_key limpio)
+    w_prod = Window.partitionBy("product_key").orderBy(
+        F.col("order_datetime").desc(),
+        F.col("product_name").asc(),
+    )
+    dim_product = (
+        clean_df
+        .select("product_key", "product_name", "category", "price", "order_datetime")
+        .withColumn("rn", F.row_number().over(w_prod))
+        .filter(F.col("rn") == 1)
+        .drop("rn", "order_datetime")
+        .orderBy("product_key")
+        .withColumn("product_sk", F.row_number().over(Window.orderBy("product_key")))
+        .select("product_sk", "product_key", "product_name", "category", F.col("price").alias("current_unit_price"))
+    )
+
+    # 2. Dimensión Cliente
+    dim_customer = (
+        clean_df
+        .select("customer_id", "order_datetime", "sales")
+        .groupBy("customer_id")
+        .agg(
+            F.min("order_datetime").alias("first_purchase_at"),
+            F.max("order_datetime").alias("last_purchase_at"),
+            F.count("*").alias("total_orders"),
+            F.sum("sales").alias("lifetime_sales"),
+        )
+        .withColumn("customer_sk", F.row_number().over(Window.orderBy("customer_id")))
+        .select("customer_sk", "customer_id", "first_purchase_at", "last_purchase_at", "total_orders", "lifetime_sales")
+    )
+
+    # 3. Dimensión Tienda
+    dim_store = (
+        clean_df
+        .select("store_location")
+        .distinct()
+        .orderBy("store_location")
+        .withColumn("store_sk", F.row_number().over(Window.orderBy("store_location")))
+        .select("store_sk", "store_location")
+    )
+
+    # 4. Dimensión Método de Pago
+    dim_payment = (
+        clean_df
+        .select("payment_method")
+        .distinct()
+        .orderBy("payment_method")
+        .withColumn("payment_sk", F.row_number().over(Window.orderBy("payment_method")))
+        .select("payment_sk", "payment_method")
+    )
+
+    # 5. Dimensión Fecha / Calendario
+    dim_date = (
+        clean_df
+        .select(F.to_date("order_datetime").alias("sale_date"))
+        .distinct()
+        .orderBy("sale_date")
+        .withColumn("date_sk", F.date_format("sale_date", "yyyyMMdd").cast("int"))
+        .withColumn("year", F.year("sale_date"))
+        .withColumn("month", F.month("sale_date"))
+        .withColumn("day", F.dayofmonth("sale_date"))
+        .withColumn("day_of_week", F.dayofweek("sale_date"))
+        .withColumn("day_name", F.date_format("sale_date", "EEEE"))
+        .withColumn("is_weekend", F.dayofweek("sale_date").isin([1, 7]))
+        .select("date_sk", "sale_date", "year", "month", "day", "day_of_week", "day_name", "is_weekend")
+    )
+
+    return {
+        "dim_product": dim_product,
+        "dim_customer": dim_customer,
+        "dim_store": dim_store,
+        "dim_payment": dim_payment,
+        "dim_date": dim_date,
+    }
+
+
+def build_fact_and_marts(clean_df, dims):
+    # Tabla unificada de hechos con joins a dimensiones
+    fact_sales = (
+        clean_df.alias("s")
+        .withColumn("sale_date", F.to_date(F.col("s.order_datetime")))
+        .join(dims["dim_product"].alias("p"), F.col("s.product_key") == F.col("p.product_key"), "left")
+        .join(dims["dim_customer"].alias("c"), F.col("s.customer_id") == F.col("c.customer_id"), "left")
+        .join(dims["dim_store"].alias("st"), F.col("s.store_location") == F.col("st.store_location"), "left")
+        .join(dims["dim_payment"].alias("pm"), F.col("s.payment_method") == F.col("pm.payment_method"), "left")
+        .join(dims["dim_date"].alias("d"), F.col("sale_date") == F.col("d.sale_date"), "left")
+        .select(
+            F.col("s.order_number").alias("transaction_id"),
+            F.col("s.order_datetime").alias("transaction_datetime"),
+            F.col("d.date_sk"),
+            F.col("p.product_sk"),
+            F.col("c.customer_sk"),
+            F.col("st.store_sk"),
+            F.col("pm.payment_sk"),
+            # Claves naturales y atributos desnormalizados útiles para BI
+            F.col("s.product_key").alias("product_id"),
+            F.col("p.product_name"),
+            F.col("p.category"),
+            F.col("s.customer_id"),
+            F.col("st.store_location"),
+            F.col("pm.payment_method"),
+            # Métricas
+            F.col("s.quantity"),
+            F.col("s.price").alias("unit_price"),
+            F.col("s.sales").alias("total_amount"),
+        )
+    )
+
+    # Mart 1: Ventas diarias por categoría y producto
+    gold_sales_daily_category = (
+        fact_sales
+        .groupBy("date_sk", "transaction_datetime", "category", "product_id", "product_name")
+        .agg(
+            F.to_date("transaction_datetime").alias("sale_date"),
+            F.countDistinct("transaction_id").alias("transactions_count"),
+            F.sum("quantity").alias("total_units_sold"),
+            F.sum("total_amount").cast("decimal(12,2)").alias("gross_revenue"),
+            F.avg("total_amount").cast("decimal(12,2)").alias("avg_order_value"),
+        )
+        .drop("transaction_datetime")
+        .groupBy("date_sk", "sale_date", "category", "product_id", "product_name")
+        .agg(
+            F.sum("transactions_count").alias("transactions_count"),
+            F.sum("total_units_sold").alias("total_units_sold"),
+            F.sum("gross_revenue").cast("decimal(12,2)").alias("gross_revenue"),
+            F.avg("avg_order_value").cast("decimal(12,2)").alias("avg_order_value"),
+        )
+        .orderBy("sale_date", F.desc("gross_revenue"))
+    )
+
+    # Mart 2: Rendimiento por tienda y método de pago
+    gold_store_payment_summary = (
+        fact_sales
+        .groupBy("store_sk", "store_location", "payment_sk", "payment_method")
+        .agg(
+            F.countDistinct("transaction_id").alias("transactions_count"),
+            F.countDistinct("customer_id").alias("unique_customers"),
+            F.sum("quantity").alias("total_units_sold"),
+            F.sum("total_amount").cast("decimal(12,2)").alias("total_revenue"),
+            F.avg("total_amount").cast("decimal(12,2)").alias("avg_ticket"),
+        )
+        .orderBy(F.desc("total_revenue"))
+    )
+
+    return fact_sales, gold_sales_daily_category, gold_store_payment_summary
+
+
+# === EJECUCIÓN GOLD A PARTIR DE clean_df ===
+clean_df.cache()
+
+gold_dims = build_dimensions(clean_df)
+fact_sales, gold_sales_daily_category, gold_store_payment_summary = build_fact_and_marts(clean_df, gold_dims)
+
+# Persistir tablas en la capa Gold (Delta Lake)
+for name, dim_df in gold_dims.items():
+    (
+        dim_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_{name}`")
+    )
+
+(
+    fact_sales.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_fact_sales`")
+)
+
+(
+    gold_sales_daily_category.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_sales_daily_category`")
+)
+
+(
+    gold_store_payment_summary.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_store_payment_summary`")
+)
+
+# Vista rápida de resultados
+print("=== fact_sales (sample) ===")
+fact_sales.show(10, truncate=False)
+
+print("=== gold_store_payment_summary ===")
+gold_store_payment_summary.show(truncate=False)
