@@ -1,0 +1,33 @@
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from pyspark.sql.window import Window
+
+# 1. Lectura limpia (sin inferSchema innecesario para tablas del catálogo)
+df_raw = (
+    spark.readStream
+    .format("cloudFiles")
+    .option("cloudFiles.format", "csv")
+    .option("header", "true")
+    .option("cloudFiles.schemaLocation", "dbfs:/schemas/transactions")
+    .load("s3://oscar-ingestion-data/transactions/")
+)
+
+df_bronze = (
+    df_raw
+    .withColumn("ingestion_timestamp", F.current_timestamp())
+    .withColumn("ingestion_date", F.current_date())
+    .withColumn("source_file_name", F.col("_metadata.file_name"))
+    .withColumn("source_file_path", F.col("_metadata.file_path"))
+    .withColumn("source_file_size", F.col("_metadata.file_size"))
+    .withColumn(
+        "source_file_modification_time",
+        F.col("_metadata.file_modification_time")
+    )
+)
+(
+    df_bronze.writeStream
+    .format("delta")
+    .option("checkpointLocation", "dbfs:/checkpoints/transactions") 
+    .trigger(availableNow=True)
+    .toTable("data_ingestion.`01_bronze`")
+)
