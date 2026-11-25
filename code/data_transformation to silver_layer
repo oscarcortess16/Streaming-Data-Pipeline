@@ -1,3 +1,13 @@
+df = (
+    spark.readStream
+    .format("cloudFiles")
+    .option("cloudFiles.format", "csv")
+    .option("header", "true")
+    .option("cloudFiles.schemaLocation", "dbfs:/schemas/transactions")
+    .load("data_ingestion.`01_bronze`")
+)
+
+
 def normalize_text_cols(df):
     return (
         df
@@ -146,3 +156,12 @@ print(f"Total clean records: {total_clean}")
 print(f"Total quarantine records: {total_quarantine}")
 print(f"Clean percentage: {(total_clean / total_source) * 100:.2f}%")
 print(f"Quarantine percentage: {(total_quarantine / total_source) * 100:.2f}%")
+
+
+df_silver = (
+    df_clean.writeStream
+    .format("delta")
+    .option("checkpointLocation", "dbfs:/checkpoints/transactions") 
+    .trigger(availableNow=True)
+    .toTable("data_ingestion.`02_silver`")
+)
