@@ -1,0 +1,148 @@
+def normalize_text_cols(df):
+    return (
+        df
+        .withColumn("order_number", F.upper(F.trim(F.col("order_number"))))
+        .withColumn("product_key", F.upper(F.trim(F.col("product_key"))))
+        .withColumn("customer_id", F.upper(F.trim(F.col("customer_id"))))
+        # Limpia espacios extra/dobles y unifica capitalización en nombres y etiquetas
+        .withColumn("product_name", F.initcap(F.regexp_replace(F.trim(F.col("product_name")), r"\s+", " ")))
+        .withColumn("category", F.regexp_replace(F.trim(F.col("category")), r"\s+", " "))
+        .withColumn("store_location", F.initcap(F.regexp_replace(F.trim(F.col("store_location")), r"\s+", " ")))
+        .withColumn("payment_method", F.regexp_replace(F.trim(F.col("payment_method")), r"\s+", " "))
+    )
+
+
+def parsing_columns(df):
+    return (
+        df
+        .withColumn(
+            "order_datetime",
+            F.try_to_timestamp(F.trim(F.col("order_datetime").cast("string")), F.lit("yyyy-MM-dd HH:mm:ss")),
+        )
+        .withColumn("quantity", F.col("quantity").cast(T.IntegerType()))
+        .withColumn("price", F.col("price").cast(T.DecimalType(10, 2)))
+        .withColumn("sales", F.col("sales").cast(T.DecimalType(10, 2)))
+    )
+
+
+def integer_columns(df):
+    return (
+        df
+        .withColumn("sales", F.abs(F.col("sales")).cast(T.DecimalType(10, 2)))
+        .withColumn("quantity", F.abs(F.col("quantity")).cast(T.IntegerType()))
+        .withColumn("price", F.abs(F.col("price")).cast(T.DecimalType(10, 2)))
+    )
+
+
+def apply_business_rules(df):
+    # 'price' y 'quantity' son la referencia para calcular 'sales' (total_amount)
+    expected_sales = (F.col("price") * F.col("quantity").cast(T.DecimalType(10, 2))).cast(T.DecimalType(10, 2))
+    is_discrepancy = F.col("sales").isNotNull() & expected_sales.isNotNull() & (F.col("sales") != expected_sales)
+    return df.withColumn("sales", F.when(is_discrepancy, expected_sales).otherwise(F.col("sales")))
+
+
+def add_quality_flags(df):
+    order_number_format = r"^TXN[0-9]{6}$"
+    product_key_format = r"^P[0-9]{3}$"
+    customer_id_format = r"^C[0-9]{4}$"
+
+    return (
+        df
+        .withColumn(
+            "is_valid_order_number",
+            F.col("order_number").isNotNull() & F.col("order_number").rlike(order_number_format),
+        )
+        .withColumn(
+            "is_valid_product_key",
+            F.col("product_key").isNotNull() & F.col("product_key").rlike(product_key_format),
+        )
+        .withColumn(
+            "is_valid_customer_id",
+            F.col("customer_id").isNotNull() & F.col("customer_id").rlike(customer_id_format),
+        )
+        .withColumn("is_valid_datetime", F.col("order_datetime").isNotNull())
+        .withColumn("is_valid_quantity", F.col("quantity").isNotNull() & (F.col("quantity") > 0))
+        .withColumn("is_valid_sales", F.col("sales").isNotNull() & (F.col("sales") > 0))
+        .withColumn("is_valid_price", F.col("price").isNotNull() & (F.col("price") > 0))
+        .withColumn(
+            "valid_record",
+            F.col("is_valid_order_number")
+            & F.col("is_valid_product_key")
+            & F.col("is_valid_customer_id")
+            & F.col("is_valid_datetime")
+            & F.col("is_valid_quantity")
+            & F.col("is_valid_sales")
+            & F.col("is_valid_price"),
+        )
+    )
+
+
+def remove_duplicates(df):
+    window_spec = Window.partitionBy("order_number").orderBy(F.col("order_datetime").desc_nulls_last())
+    return (
+        df
+        .withColumn("row_number", F.row_number().over(window_spec))
+        .filter(F.col("row_number") == 1)
+        .drop("row_number")
+    )
+
+
+# === PIPELINE PRINCIPAL UNIFICADO ===
+
+df_processed = (
+    df_renamed
+    .transform(normalize_text_cols)
+    .transform(parsing_columns)
+    .transform(integer_columns)
+    .transform(apply_business_rules)
+    .transform(add_quality_flags)
+    .transform(remove_duplicates)
+)
+
+clean_flags = [
+    "valid_record",
+    "is_valid_order_number",
+    "is_valid_product_key",
+    "is_valid_customer_id",
+    "is_valid_datetime",
+    "is_valid_quantity",
+    "is_valid_sales",
+    "is_valid_price",
+]
+
+clean_df = df_processed.filter(F.col("valid_record") == True).drop(*clean_flags)
+
+quarantine_df = (
+    df_processed
+    .filter(F.col("valid_record") == False)
+    .withColumn(
+        "quarantine_reason",
+        F.when(~F.col("is_valid_order_number"), "Invalid order number")
+        .when(~F.col("is_valid_product_key"), "Invalid product key")
+        .when(~F.col("is_valid_customer_id"), "Invalid customer id")
+        .when(~F.col("is_valid_datetime"), "Invalid datetime")
+        .when(~F.col("is_valid_quantity"), "Invalid quantity")
+        .when(~F.col("is_valid_sales"), "Invalid sales")
+        .when(~F.col("is_valid_price"), "Invalid price")
+        .otherwise("Unknown Error"),
+    )
+)
+
+# === MÉTRICAS Y SHOW ===
+
+print("=== Sample Quarantine Records ===")
+quarantine_df.select("order_number", "product_key", "customer_id", "order_datetime", "quarantine_reason").show(20, truncate=False)
+
+print("\n=== Quarantine Breakdown ===")
+quarantine_df.groupBy("quarantine_reason").count().orderBy(F.desc("count")).show(truncate=False)
+
+total_source = df.count()
+total_clean = clean_df.count()
+total_quarantine = quarantine_df.count()
+
+print("\n=== Summary ===")
+print(f"Total source records: {total_source}")
+print(f"Total clean records: {total_clean}")
+print(f"Total quarantine records: {total_quarantine}")
+print(f"Clean percentage: {(total_clean / total_source) * 100:.2f}%")
+print(f"Quarantine percentage: {(total_quarantine / total_source) * 100:.2f}%")
