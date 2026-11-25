@@ -1,6 +1,15 @@
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+clean_df = (
+    spark.readStream
+    .format("cloudFiles")
+    .option("cloudFiles.format", "csv")
+    .option("header", "true")
+    .option("cloudFiles.schemaLocation", "dbfs:/schemas/transactions")
+    .load("data_ingestion.`02_silver`")
+)
+
 def build_dimensions(clean_df):
     # 1. Dimensión Producto (1 fila por product_key limpio)
     w_prod = Window.partitionBy("product_key").orderBy(
@@ -162,7 +171,7 @@ for name, dim_df in gold_dims.items():
         .format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
-        .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_{name}`")
+        .saveAsTable(f"data_ingestion.`03_gold_{name}`")
     )
 
 (
@@ -170,7 +179,7 @@ for name, dim_df in gold_dims.items():
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_fact_sales`")
+    .saveAsTable(f"data_ingestion.`03_gold_fact_sales`")
 )
 
 (
@@ -178,7 +187,7 @@ for name, dim_df in gold_dims.items():
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_sales_daily_category`")
+    .saveAsTable(f"data_ingestion.`03_gold_sales_daily_category`")
 )
 
 (
@@ -186,7 +195,7 @@ for name, dim_df in gold_dims.items():
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{GOLD_SCHEMA}.`03_gold_store_payment_summary`")
+    .saveAsTable(f"data_ingestion.`03_gold_store_payment_summary`")
 )
 
 # Vista rápida de resultados
